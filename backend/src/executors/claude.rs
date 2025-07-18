@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use command_group::{AsyncCommandGroup, AsyncGroupChild};
@@ -13,6 +14,107 @@ use crate::{
     models::task::Task,
     utils::shell::get_shell_command,
 };
+
+// Static cache for local Claude Code detection
+static LOCAL_CLAUDE_CODE: OnceLock<Option<String>> = OnceLock::new();
+
+/// Detect if claude-code is installed locally
+async fn detect_local_claude_code() -> Option<String> {
+    let (shell_cmd, shell_arg) = get_shell_command();
+    
+    // Try to find claude-code in PATH
+    let output = Command::new(shell_cmd)
+        .arg(shell_arg)
+        .arg("which claude-code 2>/dev/null || where claude-code 2>NUL || echo")
+        .output()
+        .await
+        .ok()?;
+    
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() && !path.contains("not found") && !path.contains("Could not find") {
+            tracing::info!("Detected local claude-code at: {}", path);
+            return Some(path);
+        }
+    }
+    
+    // Check common installation locations
+    let common_paths = vec![
+        "/usr/local/bin/claude-code",
+        "/usr/bin/claude-code",
+        "/opt/homebrew/bin/claude-code",
+        "~/.local/bin/claude-code",
+    ];
+    
+    for path in common_paths {
+        let expanded_path = shellexpand::tilde(path).to_string();
+        if std::path::Path::new(&expanded_path).exists() {
+            tracing::info!("Found claude-code at common location: {}", expanded_path);
+            return Some("claude-code".to_string()); // Just use the command name if it's in a standard location
+        }
+    }
+    
+    None
+}
+
+/// Get the appropriate Claude Code command based on configuration and availability
+async fn get_claude_command(use_plan_mode: bool) -> String {
+    // First, check if there's a configured path in .claude.json
+    if let Some(config_path) = get_claude_config_path().await {
+        tracing::info!("Using Claude Code from config: {}", config_path);
+        return build_claude_command(&config_path, use_plan_mode);
+    }
+    
+    // Check if we have a cached result for local detection
+    let local_claude = LOCAL_CLAUDE_CODE.get_or_init(|| {
+        // We can't do async in OnceLock init, so we'll handle it separately
+        None
+    });
+    
+    // If not cached, detect it
+    let claude_path = if local_claude.is_none() {
+        if let Some(path) = detect_local_claude_code().await {
+            // Note: We can't update the OnceLock here due to async context
+            Some(path)
+        } else {
+            None
+        }
+    } else {
+        local_claude.clone()
+    };
+    
+    // Use local installation if available
+    if let Some(local_path) = claude_path {
+        tracing::info!("Using local Claude Code: {}", local_path);
+        return build_claude_command(&local_path, use_plan_mode);
+    }
+    
+    // Fall back to npx
+    tracing::info!("Falling back to npx Claude Code");
+    build_claude_command("npx -y @anthropic-ai/claude-code@latest", use_plan_mode)
+}
+
+/// Build the complete Claude command with appropriate flags
+fn build_claude_command(base_command: &str, use_plan_mode: bool) -> String {
+    if use_plan_mode {
+        format!("{} -p --permission-mode=plan --verbose --output-format=stream-json", base_command)
+    } else {
+        format!("{} -p --dangerously-skip-permissions --verbose --output-format=stream-json", base_command)
+    }
+}
+
+/// Read Claude configuration to check for custom path
+async fn get_claude_config_path() -> Option<String> {
+    use serde_json::Value;
+    
+    let config_path = dirs::home_dir()?.join(".claude.json");
+    let content = tokio::fs::read_to_string(&config_path).await.ok()?;
+    let config: Value = serde_json::from_str(&content).ok()?;
+    
+    config.get("claudeCodePath")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
 
 fn create_watchkill_script(command: &str) -> String {
     let claude_plan_stop_indicator =
@@ -42,7 +144,8 @@ exit "$exit_code"
 /// An executor that uses Claude CLI to process tasks
 pub struct ClaudeExecutor {
     executor_type: String,
-    command: String,
+    command: Option<String>,
+    use_plan_mode: bool,
 }
 
 impl Default for ClaudeExecutor {
@@ -56,16 +159,16 @@ impl ClaudeExecutor {
     pub fn new() -> Self {
         Self {
             executor_type: "Claude".to_string(),
-            command: "npx -y @anthropic-ai/claude-code@latest -p --dangerously-skip-permissions --verbose --output-format=stream-json".to_string(),
+            command: None, // Will be determined dynamically
+            use_plan_mode: false,
         }
     }
 
     pub fn new_plan_mode() -> Self {
-        let command = "npx -y @anthropic-ai/claude-code@latest -p --permission-mode=plan --verbose --output-format=stream-json";
-        let script = create_watchkill_script(command);
         Self {
             executor_type: "ClaudePlan".to_string(),
-            command: script,
+            command: None, // Will be determined dynamically
+            use_plan_mode: true,
         }
     }
 
@@ -73,8 +176,118 @@ impl ClaudeExecutor {
     pub fn with_command(executor_type: String, command: String) -> Self {
         Self {
             executor_type,
-            command,
+            command: Some(command),
+            use_plan_mode: false,
         }
+    }
+    
+    /// Get the command to execute, using dynamic detection if not set
+    async fn get_command(&self) -> String {
+        if let Some(ref cmd) = self.command {
+            cmd.clone()
+        } else if self.use_plan_mode {
+            let command = get_claude_command(true).await;
+            create_watchkill_script(&command)
+        } else {
+            get_claude_command(false).await
+        }
+    }
+    
+    /// Try to spawn with a specific command, with fallback on failure
+    async fn try_spawn_with_fallback(
+        &self,
+        pool: &sqlx::SqlitePool,
+        task_id: Uuid,
+        worktree_path: &str,
+        prompt: &str,
+    ) -> Result<command_group::AsyncGroupChild, ExecutorError> {
+        let primary_command = self.get_command().await;
+        
+        // Check if this is already the fallback command (npx)
+        let is_fallback = primary_command.contains("npx");
+        
+        match self.try_spawn_with_command(pool, task_id, worktree_path, prompt, &primary_command).await {
+            Ok(child) => Ok(child),
+            Err(e) if !is_fallback => {
+                // If primary command failed and it's not already npx, try fallback
+                tracing::warn!("Primary command failed: {}. Attempting fallback to npx...", e);
+                
+                let fallback_command = if self.use_plan_mode {
+                    let cmd = build_claude_command("npx -y @anthropic-ai/claude-code@latest", true);
+                    create_watchkill_script(&cmd)
+                } else {
+                    build_claude_command("npx -y @anthropic-ai/claude-code@latest", false)
+                };
+                
+                self.try_spawn_with_command(pool, task_id, worktree_path, prompt, &fallback_command).await
+                    .map_err(|fallback_err| {
+                        tracing::error!("Fallback command also failed: {}", fallback_err);
+                        fallback_err
+                    })
+            }
+            Err(e) => Err(e),
+        }
+    }
+    
+    /// Try to spawn with a specific command
+    async fn try_spawn_with_command(
+        &self,
+        _pool: &sqlx::SqlitePool,
+        task_id: Uuid,
+        worktree_path: &str,
+        prompt: &str,
+        claude_command: &str,
+    ) -> Result<command_group::AsyncGroupChild, ExecutorError> {
+        let (shell_cmd, shell_arg) = get_shell_command();
+
+        let mut command = Command::new(shell_cmd);
+        command
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .current_dir(worktree_path)
+            .arg(shell_arg)
+            .arg(claude_command)
+            .env("NODE_NO_WARNINGS", "1");
+
+        let mut child = command
+            .group_spawn()
+            .map_err(|e| {
+                crate::executor::SpawnContext::from_command(&command, &self.executor_type)
+                    .with_task(task_id, None)
+                    .with_context(format!("{} CLI execution for new task", self.executor_type))
+                    .spawn_error(e)
+            })?;
+
+        // Write prompt to stdin safely
+        if let Some(mut stdin) = child.inner().stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            tracing::debug!(
+                "Writing prompt to Claude stdin for task {}: {:?}",
+                task_id,
+                prompt
+            );
+            stdin.write_all(prompt.as_bytes()).await.map_err(|e| {
+                let context =
+                    crate::executor::SpawnContext::from_command(&command, &self.executor_type)
+                        .with_task(task_id, None)
+                        .with_context(format!(
+                            "Failed to write prompt to {} CLI stdin",
+                            self.executor_type
+                        ));
+                ExecutorError::spawn_failed(e, context)
+            })?;
+            stdin.shutdown().await.map_err(|e| {
+                let context =
+                    crate::executor::SpawnContext::from_command(&command, &self.executor_type)
+                        .with_task(task_id, None)
+                        .with_context(format!("Failed to close {} CLI stdin", self.executor_type));
+                ExecutorError::spawn_failed(e, context)
+            })?;
+        }
+
+        Ok(child)
     }
 }
 
@@ -83,7 +296,8 @@ pub struct ClaudeFollowupExecutor {
     pub session_id: String,
     pub prompt: String,
     executor_type: String,
-    command_base: String,
+    command_base: Option<String>,
+    use_plan_mode: bool,
 }
 
 impl ClaudeFollowupExecutor {
@@ -93,23 +307,18 @@ impl ClaudeFollowupExecutor {
             session_id,
             prompt,
             executor_type: "Claude".to_string(),
-            command_base: "npx -y @anthropic-ai/claude-code@latest -p --dangerously-skip-permissions --verbose --output-format=stream-json".to_string(),
+            command_base: None, // Will be determined dynamically
+            use_plan_mode: false,
         }
     }
 
     pub fn new_plan_mode(session_id: String, prompt: String) -> Self {
-        let command = format!(
-            "npx -y @anthropic-ai/claude-code@latest -p --permission-mode=plan --verbose --output-format=stream-json --resume={}",
-            session_id
-        );
-
-        let script = create_watchkill_script(&command);
-
         Self {
-            session_id,
+            session_id: session_id.clone(),
             prompt,
             executor_type: "ClaudePlan".to_string(),
-            command_base: script,
+            command_base: None, // Will be determined dynamically
+            use_plan_mode: true,
         }
     }
 
@@ -124,8 +333,118 @@ impl ClaudeFollowupExecutor {
             session_id,
             prompt,
             executor_type,
-            command_base,
+            command_base: Some(command_base),
+            use_plan_mode: false,
         }
+    }
+    
+    /// Get the command to execute, using dynamic detection if not set
+    async fn get_command(&self) -> String {
+        if let Some(ref cmd) = self.command_base {
+            format!("{} --resume={}", cmd, self.session_id)
+        } else {
+            let base_command = get_claude_command(self.use_plan_mode).await;
+            let full_command = format!("{} --resume={}", base_command, self.session_id);
+            
+            if self.use_plan_mode {
+                create_watchkill_script(&full_command)
+            } else {
+                full_command
+            }
+        }
+    }
+    
+    /// Try to spawn with fallback support
+    async fn try_spawn_with_fallback(
+        &self,
+        worktree_path: &str,
+    ) -> Result<command_group::AsyncGroupChild, ExecutorError> {
+        let primary_command = self.get_command().await;
+        let is_fallback = primary_command.contains("npx");
+        
+        match self.try_spawn_with_command(worktree_path, &primary_command).await {
+            Ok(child) => Ok(child),
+            Err(e) if !is_fallback => {
+                tracing::warn!("Primary command failed: {}. Attempting fallback to npx...", e);
+                
+                let base_fallback = build_claude_command("npx -y @anthropic-ai/claude-code@latest", self.use_plan_mode);
+                let fallback_command = format!("{} --resume={}", base_fallback, self.session_id);
+                let final_command = if self.use_plan_mode {
+                    create_watchkill_script(&fallback_command)
+                } else {
+                    fallback_command
+                };
+                
+                self.try_spawn_with_command(worktree_path, &final_command).await
+                    .map_err(|fallback_err| {
+                        tracing::error!("Fallback command also failed: {}", fallback_err);
+                        fallback_err
+                    })
+            }
+            Err(e) => Err(e),
+        }
+    }
+    
+    /// Try to spawn with a specific command
+    async fn try_spawn_with_command(
+        &self,
+        worktree_path: &str,
+        claude_command: &str,
+    ) -> Result<command_group::AsyncGroupChild, ExecutorError> {
+        let (shell_cmd, shell_arg) = get_shell_command();
+
+        let mut command = Command::new(shell_cmd);
+        command
+            .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .current_dir(worktree_path)
+            .arg(shell_arg)
+            .arg(claude_command)
+            .env("NODE_NO_WARNINGS", "1");
+
+        let mut child = command
+            .group_spawn()
+            .map_err(|e| {
+                crate::executor::SpawnContext::from_command(&command, &self.executor_type)
+                    .with_context(format!(
+                        "{} CLI followup execution for session {}",
+                        self.executor_type, self.session_id
+                    ))
+                    .spawn_error(e)
+            })?;
+
+        // Write prompt to stdin safely
+        if let Some(mut stdin) = child.inner().stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            tracing::debug!(
+                "Writing prompt to {} stdin for session {}: {:?}",
+                self.executor_type,
+                self.session_id,
+                self.prompt
+            );
+            stdin.write_all(self.prompt.as_bytes()).await.map_err(|e| {
+                let context =
+                    crate::executor::SpawnContext::from_command(&command, &self.executor_type)
+                        .with_context(format!(
+                            "Failed to write prompt to {} CLI stdin for session {}",
+                            self.executor_type, self.session_id
+                        ));
+                ExecutorError::spawn_failed(e, context)
+            })?;
+            stdin.shutdown().await.map_err(|e| {
+                let context =
+                    crate::executor::SpawnContext::from_command(&command, &self.executor_type)
+                        .with_context(format!(
+                            "Failed to close {} CLI stdin for session {}",
+                            self.executor_type, self.session_id
+                        ));
+                ExecutorError::spawn_failed(e, context)
+            })?;
+        }
+
+        Ok(child)
     }
 }
 
@@ -159,59 +478,8 @@ Task title: {}"#,
             )
         };
 
-        // Use shell command for cross-platform compatibility
-        let (shell_cmd, shell_arg) = get_shell_command();
-        // Pass prompt via stdin instead of command line to avoid shell escaping issues
-        let claude_command = &self.command;
-
-        let mut command = Command::new(shell_cmd);
-        command
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .current_dir(worktree_path)
-            .arg(shell_arg)
-            .arg(claude_command)
-            .env("NODE_NO_WARNINGS", "1");
-
-        let mut child = command
-            .group_spawn() // Create new process group so we can kill entire tree
-            .map_err(|e| {
-                crate::executor::SpawnContext::from_command(&command, &self.executor_type)
-                    .with_task(task_id, Some(task.title.clone()))
-                    .with_context(format!("{} CLI execution for new task", self.executor_type))
-                    .spawn_error(e)
-            })?;
-
-        // Write prompt to stdin safely
-        if let Some(mut stdin) = child.inner().stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            tracing::debug!(
-                "Writing prompt to Claude stdin for task {}: {:?}",
-                task_id,
-                prompt
-            );
-            stdin.write_all(prompt.as_bytes()).await.map_err(|e| {
-                let context =
-                    crate::executor::SpawnContext::from_command(&command, &self.executor_type)
-                        .with_task(task_id, Some(task.title.clone()))
-                        .with_context(format!(
-                            "Failed to write prompt to {} CLI stdin",
-                            self.executor_type
-                        ));
-                ExecutorError::spawn_failed(e, context)
-            })?;
-            stdin.shutdown().await.map_err(|e| {
-                let context =
-                    crate::executor::SpawnContext::from_command(&command, &self.executor_type)
-                        .with_task(task_id, Some(task.title.clone()))
-                        .with_context(format!("Failed to close {} CLI stdin", self.executor_type));
-                ExecutorError::spawn_failed(e, context)
-            })?;
-        }
-
-        Ok(child)
+        // Use the new method with fallback support
+        self.try_spawn_with_fallback(pool, task_id, worktree_path, &prompt).await
     }
 
     fn normalize_logs(
@@ -675,62 +943,8 @@ impl Executor for ClaudeFollowupExecutor {
         _task_id: Uuid,
         worktree_path: &str,
     ) -> Result<AsyncGroupChild, ExecutorError> {
-        // Use shell command for cross-platform compatibility
-        let (shell_cmd, shell_arg) = get_shell_command();
-        // Pass prompt via stdin instead of command line to avoid shell escaping issues
-        let claude_command = format!("{} --resume={}", self.command_base, self.session_id);
-
-        let mut command = Command::new(shell_cmd);
-        command
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .current_dir(worktree_path)
-            .arg(shell_arg)
-            .arg(&claude_command);
-
-        let mut child = command
-            .group_spawn() // Create new process group so we can kill entire tree
-            .map_err(|e| {
-                crate::executor::SpawnContext::from_command(&command, &self.executor_type)
-                    .with_context(format!(
-                        "{} CLI followup execution for session {}",
-                        self.executor_type, self.session_id
-                    ))
-                    .spawn_error(e)
-            })?;
-
-        // Write prompt to stdin safely
-        if let Some(mut stdin) = child.inner().stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            tracing::debug!(
-                "Writing prompt to {} stdin for session {}: {:?}",
-                self.executor_type,
-                self.session_id,
-                self.prompt
-            );
-            stdin.write_all(self.prompt.as_bytes()).await.map_err(|e| {
-                let context =
-                    crate::executor::SpawnContext::from_command(&command, &self.executor_type)
-                        .with_context(format!(
-                            "Failed to write prompt to {} CLI stdin for session {}",
-                            self.executor_type, self.session_id
-                        ));
-                ExecutorError::spawn_failed(e, context)
-            })?;
-            stdin.shutdown().await.map_err(|e| {
-                let context =
-                    crate::executor::SpawnContext::from_command(&command, &self.executor_type)
-                        .with_context(format!(
-                            "Failed to close {} CLI stdin for session {}",
-                            self.executor_type, self.session_id
-                        ));
-                ExecutorError::spawn_failed(e, context)
-            })?;
-        }
-
-        Ok(child)
+        // Use the new method with fallback support
+        self.try_spawn_with_fallback(worktree_path).await
     }
 
     fn normalize_logs(
@@ -772,6 +986,42 @@ mod tests {
             .entries
             .iter()
             .any(|e| e.content.contains("Unrecognized JSON")));
+    }
+
+    #[test]
+    fn test_build_claude_command() {
+        // Test normal mode
+        let cmd = build_claude_command("claude-code", false);
+        assert_eq!(cmd, "claude-code -p --dangerously-skip-permissions --verbose --output-format=stream-json");
+        
+        // Test plan mode
+        let cmd = build_claude_command("claude-code", true);
+        assert_eq!(cmd, "claude-code -p --permission-mode=plan --verbose --output-format=stream-json");
+        
+        // Test with npx
+        let cmd = build_claude_command("npx -y @anthropic-ai/claude-code@latest", false);
+        assert_eq!(cmd, "npx -y @anthropic-ai/claude-code@latest -p --dangerously-skip-permissions --verbose --output-format=stream-json");
+    }
+
+    #[tokio::test]
+    async fn test_get_claude_command_fallback() {
+        // This test assumes no local claude-code is installed
+        // and no config file exists
+        let cmd = get_claude_command(false).await;
+        assert!(cmd.contains("npx"));
+        assert!(cmd.contains("@anthropic-ai/claude-code@latest"));
+        assert!(cmd.contains("--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn test_create_watchkill_script() {
+        let command = "claude-code -p --permission-mode=plan";
+        let script = create_watchkill_script(command);
+        
+        assert!(script.contains("#!/usr/bin/env bash"));
+        assert!(script.contains("set -euo pipefail"));
+        assert!(script.contains(command));
+        assert!(script.contains("Claude requested permissions to use exit_plan_mode"));
     }
 
     #[test]
